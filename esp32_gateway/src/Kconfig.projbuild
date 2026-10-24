@@ -1,0 +1,42 @@
+menu "Gateway Configuration"
+
+    config GATEWAY_MQTT_BROKER_URI
+        string "MQTT broker URI"
+        default "mqtts://"
+        help
+            esp-mqtt enabled type. ex: mqtt://host:1883, mqtts://host:8883
+
+    config GATEWAY_MQTT_TOPIC_PREFIX
+        string "MQTT topic prefix"
+        default "lora/nodes"
+
+    config GATEWAY_UART_PORT_NUM
+        int "UART port number (STM32 link)"
+        default 1
+        range 0 2
+
+    config GATEWAY_UART_RX_PIN
+        int "UART RX pin (from STM32 TX)"
+        default 4
+
+    config GATEWAY_UART_TX_PIN
+        int "UART TX pin (to STM32 RX)"
+        default 5
+
+    config GATEWAY_NTP_SERVER
+        string "NTP server"
+        default "ntp.nict.jp"
+
+    config GATEWAY_PROV_AP_PASSWORD
+    string "Setup AP password (8 chars or more)"
+    default "gateway-setup"
+
+    config GATEWAY_PROV_BUTTON_GPIO
+        int "Setup button GPIO (hold 5s to enter setup mode)"
+        default 9
+
+    config GATEWAY_PROV_TIMEOUT_SEC
+        int "Setup mode idle timeout [s]"
+        default 300
+
+endmenu
