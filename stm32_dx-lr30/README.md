@@ -22,7 +22,9 @@ stm32_dx-lr30/
 ├── platformio.ini
 └── src/
     ├── mesh_main.cpp         # Unified mesh firmware (main firmware)
-    ├── mesh_protocol.h       # Packet structures, CRC8, device ID
+    ├── mesh_protocol.h       # Packet structures, CRC8, device ID, command verification
+    ├── siphash24.h           # SipHash-2-4 (shared with the ESP32 project)
+    ├── mesh_secret.h         # Shared relay-command key (git-ignored; create with gen_mesh_key.py)
     ├── cli_main.cpp          # Interactive LoRa CLI (RF tuning / ToA measurement)
     ├── lse_test.cpp          # LSE oscillator test
     └── BoardInfo.txt
@@ -32,6 +34,15 @@ stm32_dx-lr30/
 checkout, copy it to `lib/SX1262_Custom/`.
 
 ## Build
+
+Create the shared key once (from the repository root). The build fails without `src/mesh_secret.h`:
+
+```bash
+python3 gen_mesh_key.py     # writes stm32_dx-lr30/src/mesh_secret.h, prints the hex for the ESP32 portal
+```
+
+Add `stm32_dx-lr30/src/mesh_secret.h` to `.gitignore`. Use `--force` to generate a new key (then
+update the ESP32 and every STM32).
 
 ```bash
 # CLI build (verification / RF tuning)
@@ -57,8 +68,8 @@ extern "C" int _write(int file, char* ptr, int len) { (void)file; (void)ptr; ret
 |---|---|
 | **Node** | Battery sensor. Sleeps in STOP mode, wakes on BMI160 Any-Motion (INT1) or on a periodic heartbeat, sends with ACK + retry. |
 | **Repeater** | Always-on relay of `MeshPacket` frames (hop-limited, duplicate-suppressed). |
-| **Gateway** | Receives mesh traffic, ACKs it, and forwards it to the ESP32 over UART. Also forwards MQTT relay commands to Actuators. |
-| **Actuator** | Always-on relay output with a physical feedback input. Reports state back to the Gateway. |
+| **Gateway** | Receives mesh traffic, ACKs it, and forwards it to the ESP32 over UART. Also forwards the ESP32-signed relay commands to Actuators (it does not sign or verify them). |
+| **Actuator** | Always-on relay output with a physical feedback input. Verifies the signature and nonce of every command and reports state (and its next nonce) back to the Gateway. |
 
 ### Role detection
 
@@ -108,6 +119,9 @@ Notes:
 Check the regulations of your region before use (ARIB STD-T108 in Japan; duty cycle,
 carrier sense and transmit-time limits apply). Use a certified module with its certified antenna.
 
+The LoRa payload CRC is enabled (`radio.setCrc(true)` in `setup()`) on every role; packets that
+fail the CRC are dropped on reception. Keep this setting identical on all devices.
+
 Key timing constants in `mesh_main.cpp`:
 
 | Constant | Default | Note |
@@ -116,22 +130,48 @@ Key timing constants in `mesh_main.cpp`:
 | `ACK_TIMEOUT_MS` | 150 | Re-tune after measuring ToA |
 | `MAX_RETRIES` | 3 | Node → mesh |
 | `CMD_MAX_RETRIES` | 3 | Gateway → Actuator |
-| `CMD_CONFIRM_TIMEOUT_MS` | 300–400 | Wait for the Actuator's StatusPacket |
+| `CMD_CONFIRM_TIMEOUT_MS` | 600 | Wait for the Actuator's StatusPacket (signed `CmdPacket` and `StatusPacket` are 19 bytes each, ~370 ms on air plus the 50 ms relay delay; re-measure) |
 | `DEFAULT_HOP_LIMIT` | 3 | |
 
 ## Relay control (Gateway → Actuator)
 
 ```
 MQTT publish "<prefix>/<id>/cmd/relay": "ON" / "OFF"
-  → ESP32 (subscribed) → UART downlink frame → STM32 Gateway (command queue)
-  → LoRa CmdPacket (targetNodeId)
-  → Actuator applies it and answers immediately with a StatusPacket
-  → Gateway confirms by cmdSeq; retries up to CMD_MAX_RETRIES
+  → ESP32 (subscribed): signs the command with SipHash-2-4 over the Actuator's latest nonce
+  → UART downlink frame (nonce + tag) → STM32 Gateway (command queue, forwarded as is)
+  → LoRa CmdPacket (targetNodeId, nonce, tag)
+  → Actuator checks tag and nonce, applies the command, issues a new nonce and answers
+    immediately with a StatusPacket
+  → Gateway confirms by the applied nonce (StatusPacket.lastCmdSeqApplied);
+    retries up to CMD_MAX_RETRIES with the same signed packet
 
 Actuator → StatusPacket (periodic, on command, or when FEEDBACK_PIN changes)
   → Gateway → ESP32 → MQTT "<prefix>/<id>/status"
-     { commanded_on, feedback_pin_high, last_cmd_seq_applied, rssi, snr }
+     { commanded_on, feedback_pin_high, last_cmd_seq_applied (= nonce of the applied command), rssi, snr }
 ```
+
+### Command authentication
+
+`CmdPacket` and `StatusPacket` are 19 bytes each. `CmdPacket.cmdSeq` carries the Actuator's nonce,
+`CmdPacket.tag[8]` the SipHash-2-4 tag over `magic0 … cmdValue` (10 bytes, little-endian), and
+`StatusPacket.nonce` the Actuator's current nonce. `mesh_protocol.h` has `meshCmdVerify()`,
+`meshCmdJudge()` and `meshNonceMix()`.
+
+For each command addressed to it, the Actuator decides:
+
+| Case | Action |
+|---|---|
+| Tag does not verify | Dropped silently |
+| Tag valid, nonce is the current one | Applied; the nonce is rotated and a status with the new nonce is sent |
+| Tag valid, nonce stale (a retry of the command just applied, or a replay) | Not applied; the status is sent again (at most once per 500 ms, so replays cannot force continuous TX) |
+
+The Actuator rotates its nonce after every applied command, before every periodic status (60 s), and
+before the first status after boot. A command that was signed but never delivered therefore expires
+after at most 60 s. The nonce is derived from timing, RSSI and ADC noise hashed with the key
+(`actRotateNonce()`); it only has to not repeat.
+
+The key is `MESH_KEY[16]` in `src/mesh_secret.h` and must equal the key entered in the ESP32 setup
+portal. All STM32 devices contain it, because they share one firmware.
 
 ### Commanded state vs. feedback pin
 
@@ -165,10 +205,11 @@ unexpected change is reported immediately without waiting for the periodic statu
 | Direction | Frame | CRC8 (poly 0x07) |
 |---|---|---|
 | STM32 → ESP32 | `AA 55 LEN(2) RSSI(2) SNR(2) LoRaLen LoRaPayload CRC` | over `LEN … payload` |
-| ESP32 → STM32 | `CC 33 targetId(2) cmdType cmdValue CRC` | over `targetId … cmdValue` |
+| ESP32 → STM32 | `CC 33 targetId(2) cmdType cmdValue nonce(4) tag(8) CRC` | over `targetId … tag` |
 | ESP32 → STM32 | single byte `01` (published) / `02` (failed) | – |
 
-Both firmwares must be updated together when the frame format changes.
+Both firmwares must be updated together when the frame format changes. The STM32 Gateway does not
+check the tag; the Actuator does.
 
 ## Before production use
 
@@ -181,6 +222,9 @@ Both firmwares must be updated together when the frame format changes.
 | RF regulations | Confirm TX power, duty cycle and carrier-sense rules for your region. |
 | Heartbeat interval | Set `HEARTBEAT_INTERVAL_SEC` back to 3600 after testing. |
 | Current consumption | Measure the Node with an ammeter; the BMI160 interrupt setup alone may not reach the expected low current. |
+| Relay command key | Generate it with `gen_mesh_key.py`, enter the same hex in the ESP32 portal, and keep `mesh_secret.h` out of version control. Check that a command with a wrong key is **not** applied. |
+| Packet timing | The signed `CmdPacket`/`StatusPacket` are 19 bytes. Re-measure the time on air and tune `CMD_CONFIRM_TIMEOUT_MS`. |
+| Nonce variation | Reboot an Actuator several times and check that its nonces differ (the STM32F103 has no hardware RNG). The ADC channel used (`ATEMP`) is unverified. |
 
 ## Troubleshooting
 
@@ -189,7 +233,10 @@ Both firmwares must be updated together when the frame format changes.
 | Does not start after pressing reset while the PC serial port is closed | Boards with a CH340C auto-download circuit drive NRST/BOOT0 from DTR/RTS. Keep the terminal open, or power the board from a plain USB adapter. Power-cycling always works. |
 | Node never publishes | Heartbeat may simply be 3600 s away. Reset the Node and check for the boot heartbeat. |
 | Duplicate MQTT messages | Check for duplicated publish blocks in the ESP32 firmware. |
-| `command NOT confirmed` | Check Actuator jumpers (PB1 = GND, PB0 open, no ESP32), RF settings and distance. |
+| `command NOT confirmed` | Check Actuator jumpers (PB1 = GND, PB0 open, no ESP32), RF settings and distance. Also check that the key matches on the ESP32 and the Actuator: a wrong key drops the command silently. |
+| Command has no effect, no status change | Key mismatch between `mesh_secret.h` and the portal, or the ESP32 has no key (look for `mesh command key not set`). |
+| Command is delayed by up to 60 s | The ESP32 does not know the Actuator's nonce yet (after an ESP32 reboot or a failed command). It waits for the next status. |
+| Build error: `mesh_secret.h` not found | Run `python3 gen_mesh_key.py` from the repository root. |
 | Gateway not detected | The ESP32 UART must be initialised before the STM32 sends PING; PING is retried 5 times. |
 
 ## License

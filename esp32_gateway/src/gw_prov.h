@@ -11,6 +11,7 @@ struct GwConfig {
     char mqtt_user[64];
     char mqtt_pass[64];
     char prefix[48];       // Topic prefix (must not start or end with /)
+    char mesh_key_hex[33]; // SipHash key for relay commands: 32 hex chars, empty = not set (commands disabled)
 };
 
 extern GwConfig g_cfg;

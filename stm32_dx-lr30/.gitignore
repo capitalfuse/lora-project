@@ -1,2 +1,4 @@
 .pio
 .vscode
+src/mesh_main.cpp.orig
+src/mesh_secret.h

@@ -44,6 +44,7 @@ void gw_config_load(void) {
         nvs_read_str(h, "mqtt_user", g_cfg.mqtt_user, sizeof(g_cfg.mqtt_user));
         nvs_read_str(h, "mqtt_pass", g_cfg.mqtt_pass, sizeof(g_cfg.mqtt_pass));
         nvs_read_str(h, "prefix",    g_cfg.prefix,    sizeof(g_cfg.prefix));
+        nvs_read_str(h, "meshkey",   g_cfg.mesh_key_hex, sizeof(g_cfg.mesh_key_hex));
         nvs_close(h);
     }
     if (!g_cfg.prefix[0]) strlcpy(g_cfg.prefix, CONFIG_GATEWAY_MQTT_TOPIC_PREFIX, sizeof(g_cfg.prefix));
@@ -60,6 +61,7 @@ static esp_err_t config_save(const GwConfig& c) {
     if (e == ESP_OK) e = nvs_set_str(h, "mqtt_user", c.mqtt_user);
     if (e == ESP_OK) e = nvs_set_str(h, "mqtt_pass", c.mqtt_pass);
     if (e == ESP_OK) e = nvs_set_str(h, "prefix", c.prefix);
+    if (e == ESP_OK) e = nvs_set_str(h, "meshkey", c.mesh_key_hex);
     if (e == ESP_OK) {
         nvs_erase_key(h, KEY_FORCE);   // Clear the configuration-mode request flag (ignore if it does not exist)
         e = nvs_commit(h);
@@ -186,6 +188,36 @@ static bool prefix_ok(const char* p) {
     return true;
 }
 
+// Mesh command key: exactly 32 hex characters
+static bool mesh_key_valid(const char* k) {
+    if (strlen(k) != 32) return false;
+    for (int i = 0; i < 32; i++) {
+        if (!isxdigit((unsigned char)k[i])) return false;
+    }
+    return true;
+}
+
+static void trim_inplace(char* s) {
+    size_t n = strlen(s), a = 0;
+    while (n > 0 && isspace((unsigned char)s[n - 1])) s[--n] = '\0';
+    while (s[a] && isspace((unsigned char)s[a])) a++;
+    if (a) memmove(s, s + a, strlen(s + a) + 1);
+}
+
+enum KeyField { KEY_UNCHANGED, KEY_UPDATED, KEY_INVALID };
+
+// Blank = keep the stored key. A non-blank value is validated BEFORE it is copied, so an
+// over-long entry is rejected instead of being silently truncated.
+static KeyField apply_mesh_key_field(const char* body, char* dst, size_t dstsz) {
+    char tmp[128];
+    if (!form_get(body, "mkey", tmp, sizeof(tmp))) return KEY_UNCHANGED;
+    trim_inplace(tmp);
+    if (!tmp[0]) return KEY_UNCHANGED;
+    if (!mesh_key_valid(tmp)) return KEY_INVALID;
+    strlcpy(dst, tmp, dstsz);
+    return KEY_UPDATED;
+}
+
 // ─────────────────────────────────────────────────────────────────────────
 //  Scan nearby SSIDs (for input suggestions)
 // ─────────────────────────────────────────────────────────────────────────
@@ -271,6 +303,11 @@ static esp_err_t root_get_handler(httpd_req_t* req) {
     send_field(req, "Topic prefix", "prefix", "text", g_cfg.prefix, 47,
                "Example: lora (do not add / at the beginning or end)");
 
+    httpd_resp_sendstr_chunk(req, "<h2>Relay command key</h2>");
+    send_field(req, "Mesh key (32 hex characters)", "mkey", "password", "", 32,
+               g_cfg.mesh_key_hex[0] ? keep
+                                     : "Required for relay commands. Same key as mesh_secret.h (see gen_mesh_key.py)");
+
     httpd_resp_sendstr_chunk(req, "<button type=\"submit\">Save and reboot</button></form></body></html>");
     httpd_resp_sendstr_chunk(req, nullptr);
     return ESP_OK;
@@ -313,6 +350,7 @@ static esp_err_t save_post_handler(httpd_req_t* req) {
     form_get(body, "muser", n.mqtt_user, sizeof(n.mqtt_user));
     if (form_get(body, "mpass", tmp, sizeof(tmp)) && tmp[0]) strlcpy(n.mqtt_pass, tmp, sizeof(n.mqtt_pass));
     form_get(body, "prefix", n.prefix, sizeof(n.prefix));
+    KeyField keyRes = apply_mesh_key_field(body, n.mesh_key_hex, sizeof(n.mesh_key_hex));
     free(body);
 
     const char* err = nullptr;
@@ -322,13 +360,16 @@ static esp_err_t save_post_handler(httpd_req_t* req) {
         err = "Broker URI should be like mqtts://www.example.com:8883";
     } else if (!prefix_ok(n.prefix)) {
         err = "Invalid topic prefix (must not be empty, start or end with '/', or contain '#' or '+').";
+    } else if (keyRes == KEY_INVALID) {
+        err = "The mesh key must be exactly 32 hex characters (0-9, a-f).";
     }
     if (err) return send_msg_page(req, "400 Bad Request", err, true);
 
     if (config_save(n) != ESP_OK) {
         return send_msg_page(req, "500 Internal Server Error", "Failed to save configuration", true);
     }
-    ESP_LOGI(TAG, "config saved (ssid=%s, uri=%s, user=%s, prefix=%s)", n.ssid, n.mqtt_uri, n.mqtt_user, n.prefix);
+    ESP_LOGI(TAG, "config saved (ssid=%s, uri=%s, user=%s, prefix=%s, mesh key %s)", n.ssid, n.mqtt_uri, n.mqtt_user, n.prefix,
+             n.mesh_key_hex[0] ? "set" : "NOT set");
 
     send_msg_page(req, "200 OK", "Configuration saved. The gateway will reboot. You may close this page.", false);
     s_saved = true;

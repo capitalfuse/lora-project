@@ -23,6 +23,7 @@ esp32_gateway/                     # Standalone PlatformIO project for ESP32-C6 
     ├── gw_prov.cpp             # NVS config storage + AP-mode setup portal (web form)
     ├── gw_prov.h
     ├── idf_component.yml
+    ├── siphash24.h             # SipHash-2-4 (shared with the STM32 project)
     └── main.cpp                # Wi-Fi (STA), SNTP, MQTTS publish/subscribe, UART bridge to STM32
 ```
 
@@ -42,7 +43,9 @@ monitor and JTAG debugging (VS Code + PlatformIO Debug). No external JTAG probe 
   Gateway is still connecting or in setup mode.
 - Receives frames from the STM32 over UART and publishes them to MQTT over TLS.
   Returns a result byte to the STM32 (`0x01` = success, `0x02` = failure).
-- Subscribes to relay commands and forwards them to the STM32 over UART.
+- Subscribes to relay commands, signs them with SipHash-2-4 over the target Actuator's latest nonce
+  and forwards them to the STM32 over UART (see *Relay command signing*). Relay commands are
+  disabled until a valid key is set in the setup portal; sensor data keeps working.
 
 ### MQTT topics
 
@@ -53,6 +56,9 @@ monitor and JTAG debugging (VS Code + PlatformIO Debug). No external JTAG probe 
 | Publish | `<prefix>/<node_id>/data` | JSON: `node_id`, `seq`, `event_type` (`heartbeat`/`motion`), `rssi`, `snr`, `hop_limit`, and `ax..gz` when present |
 | Publish | `<prefix>/<node_id>/status` | JSON: `node_id`, `seq`, `commanded_on`, `feedback_pin_high`, `last_cmd_seq_applied`, `rssi`, `snr` |
 | Subscribe | `<prefix>/+/cmd/relay` | `ON` or `1` = on, anything else = off |
+
+`last_cmd_seq_applied` is the nonce of the command the Actuator applied last, not a counter. It
+changes with every applied command, so compare it for change rather than order.
 
 Messages are published with QoS 0. The prefix must not start or end with `/`, must not contain
 `#` or `+`, and must be at most 47 characters.
@@ -88,6 +94,7 @@ Losing Wi-Fi *while running* does not trigger setup mode; the Gateway keeps retr
 | Broker URI | Must start with `mqtts://`, e.g. `mqtts://mqtt.example.com:8884` |
 | MQTT username / password | Password left blank = keep the current value |
 | Topic prefix | See the topic rules above |
+| Relay command key | 32 hex characters, the same key as `mesh_secret.h` on the STM32 (create it with `gen_mesh_key.py`). Password field; blank = keep the current value. Anything other than 32 hex characters is rejected. Without a valid key, relay commands are disabled |
 
 If nobody touches the portal for `CONFIG_GATEWAY_PROV_TIMEOUT_SEC` (default 300 s), the Gateway
 reboots and tries STA mode again. This keeps it recovering by itself after a power outage while
@@ -96,7 +103,7 @@ the router is still down.
 ### Build-time options (Kconfig)
 
 ```bash
-cd project/esp32_gateway
+cd esp32_gateway
 pio run -t menuconfig
 # "Gateway Configuration" menu
 ```
@@ -113,7 +120,9 @@ pio run -t menuconfig
 | `GATEWAY_PROV_TIMEOUT_SEC` | Setup mode idle timeout (default 300) |
 
 The old `GATEWAY_WIFI_SSID`, `GATEWAY_WIFI_PASSWORD`, `GATEWAY_MQTT_USERNAME` and
-`GATEWAY_MQTT_PASSWORD` options are no longer used and can be removed.
+`GATEWAY_MQTT_PASSWORD` options are no longer used and can be removed. The relay command key is
+deliberately **not** a Kconfig option, so it never ends up in `sdkconfig` or the source tree. If an
+older `GATEWAY_MESH_KEY_HEX` line is still in your `sdkconfig`, delete it.
 
 On the ESP32-C6, GPIO9 is a strapping pin. Pressing it *after* boot is fine, but holding it low
 during reset enters the ROM download mode.
@@ -152,6 +161,31 @@ idf_component_register(
 
 If you use a custom CA, also add `board_build.embed_txtfiles = src/ca_cert.pem` to
 `esp32_gateway/platformio.ini`.
+
+## Relay command signing
+
+Each Actuator announces a single-use nonce in every status packet. The Gateway forwards those statuses
+over UART, and the ESP32 keeps the latest nonce per node (8 slots, mutex-protected).
+
+For an MQTT command on `<prefix>/<node_id>/cmd/relay`:
+
+1. If a fresh nonce is known, the ESP32 signs the 10 bytes `C0 60 target(2) nonce(4) type value`
+   (little-endian) with SipHash-2-4 (8-byte tag) and sends the UART frame at once.
+2. Otherwise only the latest command per node is held, for at most 70 s, and sent when the next status
+   arrives.
+3. After sending, the nonce counts as used. If no new status arrives within 3 s, the command is assumed
+   lost and the same nonce is used again.
+
+UART downlink frame (19 bytes): `CC 33 targetId(2) cmdType cmdValue nonce(4) tag(8) CRC8`, with the CRC8
+over `targetId … tag`.
+
+The key is read from NVS (`meshkey`) after the configuration is loaded. Log lines to look for:
+
+| Log | Meaning |
+|---|---|
+| `mesh command key not set: enter it in the setup portal. Relay commands are disabled` | No valid 32-hex key is stored |
+| `no nonce for node N yet; command waits for its next status (up to 60 s)` | The Actuator's nonce is not known yet |
+| `nonce table full, relay command dropped` | More than 8 Actuators were seen |
 
 ## MQTTS and broker setup
 
@@ -276,6 +310,7 @@ ESP32 answers the UART PING (0xF0) / PONG (0xF1) handshake
 |---|---|---|
 | Gateway Wi-Fi / MQTT settings | Enter SSID, Wi-Fi password, `mqtts://` broker URI, MQTT credentials and topic prefix through the setup portal; change the default setup AP password | `esp32_gateway` (`gw_prov.cpp`, Kconfig) |
 | Broker user and ACL | Create a dedicated Mosquitto user for the Gateway and restrict it with an ACL that matches the topic prefix | Mosquitto `passwd` / `acl.conf` |
+| Relay command key | Generate it with `gen_mesh_key.py`, enter the same 32 hex characters in the setup portal and keep `mesh_secret.h` on the STM32 side out of version control | Setup portal, `stm32_dx-lr30/src/mesh_secret.h` |
 
 ## Security notes
 
@@ -283,6 +318,9 @@ ESP32 answers the UART PING (0xF0) / PONG (0xF1) handshake
   Consider enabling it if the device can be physically accessed.
 - The setup portal uses plain HTTP, protected only by the WPA2 setup AP. Change
   `CONFIG_GATEWAY_PROV_AP_PASSWORD` from its default.
+- The relay command key is stored in NVS in plain text as well (NVS encryption protects it). Anyone
+  who obtains the key can create valid relay commands, so treat it like a password and generate a new
+  one (`gen_mesh_key.py --force`) if it may have leaked.
 - Do not commit `sdkconfig` to version control if it contains credentials.
 - Only `mqtts://` URIs are accepted by the setup form. Relax the check in `save_post_handler()`
   only if you deliberately need plain MQTT on a trusted network.

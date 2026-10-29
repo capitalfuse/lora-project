@@ -26,6 +26,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/event_groups.h"
+#include "freertos/semphr.h"
 
 #include "esp_wifi.h"
 #include "esp_event.h"
@@ -39,6 +40,7 @@
 #include "driver/uart.h"
 #include "cJSON.h"
 #include "gw_prov.h"
+#include "siphash24.h"
 
 #include "esp_timer.h"
 #include "led_strip.h"
@@ -190,6 +192,158 @@ static esp_mqtt_client_handle_t s_mqtt_client = nullptr;
 static volatile bool s_mqtt_connected = false;
 
 static uint8_t calc_crc8(const uint8_t* data, size_t len);
+
+// ─────────────────────────────────────────────────────────────────────────
+//  Command authentication: SipHash-2-4 tag over an Actuator-issued one-time nonce
+//  Signed message = C0 60 targetL targetH nonce0..nonce3 type value  (matches CmdPacket on the STM32)
+//
+//  Each Actuator announces its current nonce in every StatusPacket (forwarded here by the STM32).
+//  A command is signed with the latest nonce we saw for that node, then the nonce is considered
+//  used until a newer status arrives. The Actuator rotates the nonce after every applied command
+//  and at every periodic status (60 s), so a signed packet cannot be replayed later.
+//  No clock and no stored counter are needed.
+// ─────────────────────────────────────────────────────────────────────────
+struct NonceEntry {
+    bool     used;           // slot in use
+    uint16_t nodeId;
+    uint32_t nonce;
+    bool     valid;          // nonce not yet consumed by a command we sent
+    int64_t  usedAtUs;       // when we last consumed it
+    bool     pend;           // a command is waiting for a fresh nonce
+    uint8_t  pendValue;
+    int64_t  pendDeadlineUs;
+};
+static const int     NONCE_SLOTS = 8;
+static NonceEntry    s_nonce[NONCE_SLOTS];
+static SemaphoreHandle_t s_nonce_mtx = nullptr;
+static const int64_t NONCE_REUSE_AFTER_US = 3LL * 1000 * 1000;   // no status 3 s after sending: assume the command was lost, nonce unused
+static const int64_t PENDING_TIMEOUT_US   = 70LL * 1000 * 1000;  // > the Actuator's 60 s periodic status
+
+static uint8_t  s_mesh_key[16];
+static volatile bool s_mesh_key_ok = false;   // set only after s_mesh_key is filled
+
+static bool parse_hex_key(const char* hex, uint8_t out[16]) {
+    if (strlen(hex) != 32) return false;
+    for (int i = 0; i < 16; i++) {
+        char t[3] = { hex[2 * i], hex[2 * i + 1], 0 };
+        char* end = nullptr;
+        unsigned long v = strtoul(t, &end, 16);
+        if (*end != '\0') return false;
+        out[i] = (uint8_t)v;
+    }
+    return true;
+}
+
+static void cmd_auth_init() {               // call before the UART task starts (creates the mutex)
+    s_nonce_mtx = xSemaphoreCreateMutex();
+}
+
+// The key comes from the setup portal (NVS). Call after gw_config_load().
+static void cmd_auth_load_key() {
+    s_mesh_key_ok = false;
+    if (parse_hex_key(g_cfg.mesh_key_hex, s_mesh_key)) {
+        s_mesh_key_ok = true;
+    } else {
+        ESP_LOGE(TAG, "mesh command key not set: enter it in the setup portal. Relay commands are disabled");
+    }
+}
+
+static void cmd_sign(uint16_t nodeId, uint8_t type, uint8_t value, uint32_t nonce, uint8_t tag[8]) {
+    uint8_t msg[10] = {
+        0xC0, 0x60, (uint8_t)(nodeId & 0xFF), (uint8_t)(nodeId >> 8),
+        (uint8_t)nonce, (uint8_t)(nonce >> 8), (uint8_t)(nonce >> 16), (uint8_t)(nonce >> 24),
+        type, value
+    };
+    uint64_t t = siphash24(s_mesh_key, msg, sizeof(msg));
+    for (int i = 0; i < 8; i++) tag[i] = (uint8_t)(t >> (8 * i));
+}
+
+// CC 33 | target(2) type value | nonce(4) | tag(8) | CRC8 over everything between the magic and the CRC
+static void send_signed_cmd(uint16_t nodeId, uint8_t value, uint32_t nonce) {
+    uint8_t frame[19];
+    frame[0] = 0xCC; frame[1] = 0x33;
+    frame[2] = nodeId & 0xFF;
+    frame[3] = (nodeId >> 8) & 0xFF;
+    frame[4] = 0;      // cmdType = 0 (relay control)
+    frame[5] = value;
+    frame[6] = (uint8_t)nonce;
+    frame[7] = (uint8_t)(nonce >> 8);
+    frame[8] = (uint8_t)(nonce >> 16);
+    frame[9] = (uint8_t)(nonce >> 24);
+    cmd_sign(nodeId, frame[4], frame[5], nonce, &frame[10]);
+    frame[18] = calc_crc8(&frame[2], 16);
+    uart_write_bytes(UART_PORT, (const char*)frame, sizeof(frame));
+    ESP_LOGI(TAG, "relay cmd -> node %u = %u (nonce %08lx)", nodeId, value, (unsigned long)nonce);
+}
+
+// Caller holds s_nonce_mtx.
+static NonceEntry* nonce_find(uint16_t nodeId, bool create) {
+    NonceEntry* freeSlot = nullptr;
+    for (int i = 0; i < NONCE_SLOTS; i++) {
+        if (s_nonce[i].used && s_nonce[i].nodeId == nodeId) return &s_nonce[i];
+        if (!s_nonce[i].used && !freeSlot) freeSlot = &s_nonce[i];
+    }
+    if (!create || !freeSlot) return nullptr;
+    memset(freeSlot, 0, sizeof(*freeSlot));
+    freeSlot->used = true;
+    freeSlot->nodeId = nodeId;
+    return freeSlot;
+}
+
+// Caller holds s_nonce_mtx. Consumes the nonce if one is available.
+static bool nonce_take(NonceEntry* e, uint32_t* nonce, int64_t nowUs) {
+    bool known = e->usedAtUs != 0 || e->valid;
+    if (!known) return false;
+    if (!e->valid && (nowUs - e->usedAtUs) > NONCE_REUSE_AFTER_US) e->valid = true;   // no news: the last command probably never arrived
+    if (!e->valid) return false;
+    *nonce = e->nonce;
+    e->valid = false;
+    e->usedAtUs = nowUs;
+    return true;
+}
+
+// Called for every StatusPacket forwarded by the STM32 (UART task).
+static void nonce_on_status(uint16_t nodeId, uint32_t nonce) {
+    if (!s_nonce_mtx) return;
+    bool send = false; uint8_t value = 0; uint32_t n = 0;
+    int64_t now = esp_timer_get_time();
+    xSemaphoreTake(s_nonce_mtx, portMAX_DELAY);
+    NonceEntry* e = nonce_find(nodeId, true);
+    if (e) {
+        e->nonce = nonce;
+        e->valid = true;
+        if (e->pend) {
+            e->pend = false;
+            if (now < e->pendDeadlineUs && nonce_take(e, &n, now)) { send = true; value = e->pendValue; }
+        }
+    }
+    xSemaphoreGive(s_nonce_mtx);
+    if (send && s_mesh_key_ok) send_signed_cmd(nodeId, value, n);
+}
+
+// Called for each MQTT relay command: sign now if a nonce is available, otherwise wait for the next status.
+static void nonce_submit_cmd(uint16_t nodeId, uint8_t value) {
+    if (!s_mesh_key_ok) { ESP_LOGE(TAG, "no valid mesh key, relay command dropped"); return; }
+    bool send = false; uint32_t n = 0;
+    int64_t now = esp_timer_get_time();
+    xSemaphoreTake(s_nonce_mtx, portMAX_DELAY);
+    NonceEntry* e = nonce_find(nodeId, true);
+    if (!e) {
+        xSemaphoreGive(s_nonce_mtx);
+        ESP_LOGE(TAG, "nonce table full, relay command dropped");
+        return;
+    }
+    if (nonce_take(e, &n, now)) {
+        send = true;
+    } else {
+        e->pend = true;                       // only the latest command per node is kept
+        e->pendValue = value;
+        e->pendDeadlineUs = now + PENDING_TIMEOUT_US;
+    }
+    xSemaphoreGive(s_nonce_mtx);
+    if (send) send_signed_cmd(nodeId, value, n);
+    else ESP_LOGW(TAG, "no nonce for node %u yet; command waits for its next status (up to 60 s)", nodeId);
+}
 // Forward declaration for UART-related functionality (defined in the STM32 UART link section)
 static void handle_relay_command(const char* topic, int topic_len, const char* data, int data_len) {
     char topicBuf[128] = {};
@@ -212,16 +366,7 @@ static void handle_relay_command(const char* topic, int topic_len, const char* d
     uint16_t nodeId = (uint16_t)atoi(topicBuf + prefixLen);
     uint8_t value = (strcasecmp(payloadBuf, "ON") == 0 || strcmp(payloadBuf, "1") == 0) ? 1 : 0;
 
-    uint8_t frame[7];
-    frame[0] = 0xCC; frame[1] = 0x33;
-    frame[2] = nodeId & 0xFF;
-    frame[3] = (nodeId >> 8) & 0xFF;
-    frame[4] = 0;      // cmdType = 0 (relay control)
-    frame[5] = value;
-    frame[6] = calc_crc8(&frame[2], 4);   // target(2) + type + value
-    uart_write_bytes(UART_PORT, (const char*)frame, sizeof(frame));
-
-    ESP_LOGI(TAG, "relay cmd -> node %u = %u (topic=%s)", nodeId, value, topicBuf);
+    nonce_submit_cmd(nodeId, value);
 }
 
 static void mqtt_event_handler(void* handler_args, esp_event_base_t base,
@@ -336,6 +481,7 @@ struct __attribute__((packed)) StatusPacket {
     uint8_t  commandedState;
     uint8_t  feedbackPinState; // Raw HIGH (1) / LOW (0) state of FEEDBACK_PIN
     uint32_t lastCmdSeqApplied;
+    uint32_t nonce;            // The Actuator's current one-time nonce
     uint8_t  crc8;
 };
 
@@ -404,6 +550,7 @@ static void handle_complete_frame(const uint8_t* frameBuf, uint16_t payloadLen) 
         } else if (loraLen >= sizeof(StatusPacket) && loraPayload[0] == 0xB2 && loraPayload[1] == 0x60) {
             StatusPacket sp;
             memcpy(&sp, loraPayload, sizeof(StatusPacket));
+            nonce_on_status(sp.originId, sp.nonce);   // remember the Actuator's nonce for the next command
 
             cJSON* doc = cJSON_CreateObject();
             cJSON_AddNumberToObject(doc, "node_id", sp.originId);
@@ -513,6 +660,7 @@ extern "C" void app_main(void) {
         ret = nvs_flash_init();
     }
     ESP_ERROR_CHECK(ret);
+    cmd_auth_init();
 
     ESP_ERROR_CHECK(esp_netif_init());
     ESP_ERROR_CHECK(esp_event_loop_create_default());
@@ -530,6 +678,7 @@ extern "C" void app_main(void) {
     led_strip_clear(s_led_strip);
 
     gw_config_load();
+    cmd_auth_load_key();
     bool force = gw_prov_requested();   // Wi-Fi connection failure flag from the previous boot (check and consume it first)
     if (!g_cfg.valid || force) {
         ESP_LOGW(TAG, "entering setup (AP) mode");

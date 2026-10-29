@@ -40,6 +40,7 @@
 #include <STM32RTC.h>
 #include <STM32LowPower.h>
 #include "sx1262_driver.h"
+#include "mesh_secret.h"      // const uint8_t MESH_KEY[16] (do not commit; must match the ESP32 key)
 #include "mesh_protocol.h"
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -89,7 +90,7 @@ static const uint32_t HEARTBEAT_INTERVAL_SEC = 3600;    // [For testing] Normall
 static const uint32_t MOTION_COOLDOWN_MS     = 5000;  // Suppress retransmissions during continuous motion
 
 static const uint8_t  CMD_MAX_RETRIES        = 3;     // Number of retries for Gateway-to-relay-Node commands
-static const uint32_t CMD_CONFIRM_TIMEOUT_MS = 400;   // Wait for StatusPacket confirmation from relay Node (can be short because RX is always on)
+static const uint32_t CMD_CONFIRM_TIMEOUT_MS = 600;   // Wait for StatusPacket confirmation from relay Node. Raised from 400: the signed CmdPacket (19 B) plus the status reply (19 B) is ~370 ms on air at SF9/BW125 plus the 50 ms relay delay (re-measure with the CLI build)
 static const uint32_t CMD_RETRY_BACKOFF_MIN  = 100;
 static const uint32_t CMD_RETRY_BACKOFF_MAX  = 300;
 
@@ -115,6 +116,10 @@ static bool       sensorAvailable = false;
 static uint8_t  actCommandedState = 0;               // bit0 = commanded state for relay 1
 static uint8_t  actFeedbackPinState = 0;              // Raw HIGH(1)/LOW(0) level of FEEDBACK_PIN
 static uint32_t actLastCmdSeqApplied = 0xFFFFFFFFUL;  // Initial value indicating that no command has been applied
+static uint32_t actNonce = 0xFFFFFFFFUL;              // Current one-time nonce (commands must carry it)
+static uint32_t actNonceCtr = 0;
+static uint32_t actLastStaleReplyMs = 0;              // Rate limit for status replies to stale commands
+static const uint32_t ACT_STALE_REPLY_MIN_MS = 500;   // Keeps replayed packets from forcing continuous TX
 static uint32_t actLastStatusSentMs = 0;
 static uint32_t actStatusSeq = 0;
 static uint8_t  actDebounceRawState = 0;
@@ -363,7 +368,7 @@ static void onMotionWake() { motionWakeFlag = true; }
 //  UART communication with ESP32 (Gateway only)
 //  Uplink: [0xAA][0x55][LEN(2)][RSSI(2)][SNR(2)][LoRaLen][LoRaPayload...][CRC8] -> ESP32
 //        Response: 0x01 = publish succeeded / 0x02 = failed (waited for inside forwardToEsp32)
-//  Downlink: [0xCC][0x33][targetNodeId(2)][cmdType][cmdValue][CRC8(unused)] <- ESP32
+//  Downlink: [0xCC][0x33][targetNodeId(2)][cmdType][cmdValue][CRC8] <- ESP32
 //        (Relay control command received via MQTT subscription)
 //  Both directions must be polled continuously over the same Serial3 interface,
 //  so all reception is handled in one place (pollEsp32Downlink), and
@@ -371,27 +376,27 @@ static void onMotionWake() { motionWakeFlag = true; }
 // ─────────────────────────────────────────────────────────────────────────
 static volatile uint8_t lastForwardResult = 0; // 0=pending, 0x01=success, 0x02=failure
 
-enum Esp32RxState {
-    E_IDLE, E_CMD_MAGIC2, E_CMD_TARGET_L, E_CMD_TARGET_H, E_CMD_TYPE, E_CMD_VALUE, E_CMD_CRC
-};
+enum Esp32RxState { E_IDLE, E_CMD_MAGIC2, E_CMD_BODY, E_CMD_CRC };
 static Esp32RxState esp32RxState = E_IDLE;
-static uint16_t     esp32CmdTarget = 0;
-static uint8_t      esp32CmdType = 0;
-static uint8_t      esp32CmdValue = 0;
-static uint8_t      esp32CmdBuf[4];   // target(2), type, value
+static const uint8_t ESP32_CMD_BODY_LEN = 16;   // target(2) type(1) value(1) nonce(4) tag(8)
+static uint8_t      esp32CmdBuf[ESP32_CMD_BODY_LEN];
+static uint8_t      esp32CmdIdx = 0;
 
-static bool sendCommandToActuator(uint16_t targetId, uint8_t cmdType, uint8_t cmdValue);
+// A command signed by the ESP32. The Gateway STM32 only forwards it; the Actuator verifies the tag.
+// `seq` holds the Actuator's nonce (it is also the id the Actuator reports back as applied).
+struct PendingCmd { uint16_t target; uint8_t type; uint8_t value; uint32_t seq; uint8_t tag[8]; };
+
+static bool sendCommandToActuator(const PendingCmd& c);
 static void handleIncomingMeshPacket(const PacketInfo& pkt);
 
-struct PendingCmd { uint16_t target; uint8_t type; uint8_t value; };
 static const uint8_t CMD_QUEUE_SIZE = 4;
 static PendingCmd cmdQueue[CMD_QUEUE_SIZE];
 static uint8_t cmdQHead = 0, cmdQTail = 0;
 
-static bool cmdQueuePush(uint16_t t, uint8_t ty, uint8_t v) {
+static bool cmdQueuePush(const PendingCmd& c) {
     uint8_t next = (cmdQTail + 1) % CMD_QUEUE_SIZE;
     if (next == cmdQHead) return false;   // Drop the command if the queue is full
-    cmdQueue[cmdQTail] = { t, ty, v };
+    cmdQueue[cmdQTail] = c;
     cmdQTail = next;
     return true;
 }
@@ -414,37 +419,29 @@ static void pollEsp32Downlink() {
                 }
                 break;
             case E_CMD_MAGIC2:
-                esp32RxState = (b == 0x33) ? E_CMD_TARGET_L : E_IDLE;
+                esp32RxState = (b == 0x33) ? E_CMD_BODY : E_IDLE;
+                esp32CmdIdx = 0;
                 break;
-            case E_CMD_TARGET_L:
-                esp32CmdTarget = b;
-                esp32CmdBuf[0] = b;
-                esp32RxState = E_CMD_TARGET_H;
-                break;
-            case E_CMD_TARGET_H:
-                esp32CmdTarget |= ((uint16_t)b << 8);
-                esp32CmdBuf[1] = b;
-                esp32RxState = E_CMD_TYPE;
-                break;
-            case E_CMD_TYPE:
-                esp32CmdType = b;
-                esp32CmdBuf[2] = b;
-                esp32RxState = E_CMD_VALUE;
-                break;
-            case E_CMD_VALUE:
-                esp32CmdValue = b;
-                esp32CmdBuf[3] = b;
-                esp32RxState = E_CMD_CRC;
+            case E_CMD_BODY:
+                esp32CmdBuf[esp32CmdIdx++] = b;
+                if (esp32CmdIdx >= ESP32_CMD_BODY_LEN) esp32RxState = E_CMD_CRC;
                 break;
             case E_CMD_CRC:
-                if (b != crc8(esp32CmdBuf, 4)) {
+                if (b != crc8(esp32CmdBuf, ESP32_CMD_BODY_LEN)) {
                     DBGLN("[GW] cmd CRC mismatch, dropped");
                 } else {
+                    PendingCmd c;
+                    c.target = (uint16_t)(esp32CmdBuf[0] | ((uint16_t)esp32CmdBuf[1] << 8));
+                    c.type   = esp32CmdBuf[2];
+                    c.value  = esp32CmdBuf[3];
+                    c.seq    = (uint32_t)esp32CmdBuf[4] | ((uint32_t)esp32CmdBuf[5] << 8) |
+                               ((uint32_t)esp32CmdBuf[6] << 16) | ((uint32_t)esp32CmdBuf[7] << 24);
+                    memcpy(c.tag, &esp32CmdBuf[8], 8);
                     DBG("[GW] cmd queued: target=");
-                    DBG(esp32CmdTarget);
+                    DBG(c.target);
                     DBG(" value=");
-                    DBGLN(esp32CmdValue);
-                    if (!cmdQueuePush(esp32CmdTarget, esp32CmdType, esp32CmdValue)) {
+                    DBGLN(c.value);
+                    if (!cmdQueuePush(c)) {
                         DBGLN("[GW] cmd queue full, dropped");
                     }
                 }
@@ -511,9 +508,11 @@ static void dispatchGatewayPacket(const PacketInfo& pkt) {
 //  so power-saving measures like those in sendWithAck() for Nodes are unnecessary. The implementation simply
 //  sends a command, waits for a StatusPacket confirmation, and retries on timeout.
 // ─────────────────────────────────────────────────────────────────────────
-static bool sendCommandToActuator(uint16_t targetId, uint8_t cmdType, uint8_t cmdValue) {
-    static uint32_t cmdSeqCounter = 0;
-    uint32_t seq = cmdSeqCounter++;
+static bool sendCommandToActuator(const PendingCmd& c) {
+    const uint16_t targetId = c.target;
+    const uint8_t  cmdType  = c.type;
+    const uint8_t  cmdValue = c.value;
+    const uint32_t seq      = c.seq;   // the Actuator's nonce; retries reuse the same signed packet
 
     for (uint8_t attempt = 0; attempt < CMD_MAX_RETRIES; attempt++) {
         CmdPacket cp{};
@@ -522,6 +521,7 @@ static bool sendCommandToActuator(uint16_t targetId, uint8_t cmdType, uint8_t cm
         cp.cmdSeq = seq;
         cp.cmdType = cmdType;
         cp.cmdValue = cmdValue;
+        memcpy(cp.tag, c.tag, 8);
         cp.crc8 = crc8((uint8_t*)&cp, sizeof(cp) - 1);
 
         radio.send((const uint8_t*)&cp, sizeof(cp));
@@ -668,6 +668,16 @@ static uint8_t actReadFeedbackPin() {
     return (digitalRead(FEEDBACK_PIN) == HIGH) ? 1 : 0;
 }
 
+// Issue a new single-use nonce. Call it right before a status that should announce it.
+static void actRotateNonce() {
+    uint32_t adc = 0;
+#ifdef ATEMP
+    adc = (uint32_t)analogRead(ATEMP);   // internal temperature channel as a noise source (unverified)
+#endif
+    actNonce = meshNonceMix(MESH_KEY, actNonce, ++actNonceCtr, micros(),
+                            (int32_t)radio.readRssi(), adc);
+}
+
 static void actSendStatus() {
     StatusPacket sp{};
     sp.magic0 = 0xB2; sp.magic1 = 0x60;
@@ -676,6 +686,7 @@ static void actSendStatus() {
     sp.commandedState = actCommandedState;
     sp.feedbackPinState = actFeedbackPinState;
     sp.lastCmdSeqApplied = actLastCmdSeqApplied;
+    sp.nonce = actNonce;
     sp.crc8 = crc8((uint8_t*)&sp, sizeof(sp) - 1);
 
     radio.send((const uint8_t*)&sp, sizeof(sp));
@@ -695,6 +706,22 @@ static void loopActuator() {
         memcpy(&cp, pkt.data, sizeof(cp));
 
         if (cp.magic0 == 0xC0 && cp.magic1 == 0x60 && cp.targetNodeId == myNodeId) {
+            MeshCmdVerdict verdict = meshCmdJudge(cp, MESH_KEY, actNonce);
+            if (verdict == MCV_REJECT) {
+                DBGLN("[ACT] cmd tag mismatch, dropped");
+                return;
+            }
+            if (verdict == MCV_RESEND_STATUS) {
+                // Authentic but the nonce was already used (retry of an applied command) or is
+                // outdated. Never re-apply; report the status so the Gateway sees the result and
+                // the current nonce. Rate-limited so replayed packets cannot force continuous TX.
+                if (millis() - actLastStaleReplyMs >= ACT_STALE_REPLY_MIN_MS) {
+                    actLastStaleReplyMs = millis();
+                    actSendStatus();
+                    actLastStatusSentMs = millis();
+                }
+                return;
+            }
             DBG("[ACT] cmd received type=");
             DBG(cp.cmdType);
             DBG(" value=");
@@ -714,6 +741,7 @@ static void loopActuator() {
             actDebounceRawState = actFeedbackPinState;
             actDebounceSinceMs = millis();
 
+            actRotateNonce();   // single-use: announce a fresh nonce together with the result
             actSendStatus(); // Immediately report both the commanded and measured states
             actLastStatusSentMs = millis();
         }
@@ -743,6 +771,7 @@ static void loopActuator() {
     if (millis() - actLastStatusSentMs >= ACTUATOR_STATUS_INTERVAL_MS) {
         actLastStatusSentMs = millis();
         actFeedbackPinState = actReadFeedbackPin();
+        actRotateNonce();   // bounds how long a command that was signed but not delivered stays valid
         actSendStatus();
     }
 }
@@ -811,7 +840,7 @@ static void loopGateway() {
 
     PendingCmd c;
     if (cmdQueuePop(c)) {
-        sendCommandToActuator(c.target, c.type, c.value);
+        sendCommandToActuator(c);
     }
 
     PacketInfo pkt;
@@ -860,6 +889,7 @@ void setup() {
     radio.setBandwidth(SX1262Radio::bwFromKHz(RF_BW_KHZ));
     radio.setCodingRate(RF_CR);
     radio.setTxPower(RF_TX_POWER_DBM);
+    radio.setCrc(true);
 
     myNodeId = deviceId16();
     myRole = determineRole();
@@ -905,6 +935,7 @@ void setup() {
             actDebounceSinceMs = millis();
 
             radio.startReceive(); // Assumes continuous power and RX; do not use STOP mode
+            actRotateNonce();
             actSendStatus(); // Report the current state once at startup for initial Gateway synchronization
             actLastStatusSentMs = millis();
             break;
